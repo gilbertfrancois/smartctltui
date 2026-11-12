@@ -1627,16 +1627,17 @@ def draw_drives(win: curses.window, st: AppState) -> None:
         return
     st.sel = max(0, min(st.sel, len(st.drives) - 1))
     st.top = max(0, min(st.top, st.sel), st.sel - inner_h + 2)
-    cols = (14, 7, 0, 20, 10, 7)
+    type_w = max(7, *(len(drv.dtype or "-") for drv in st.drives))
+    cols = (14, type_w, 0, 20, 10, 7)
     model_w = max(10, w - 4 - sum(cols) - 5 * 2)
-    header = f"{'DEVICE':<14}  {'TYPE':<7}  {'MODEL':<{model_w}}  {'SERIAL':<20}  {'SIZE':>10}  {'HEALTH':<7}"
+    header = f"{'DEVICE':<14}  {'TYPE':<{type_w}}  {'MODEL':<{model_w}}  {'SERIAL':<20}  {'SIZE':>10}  {'HEALTH':<7}"
     put(win, 2, 2, header, ATTRS["dim"])
     for i, drv in enumerate(st.drives[st.top : st.top + inner_h - 1]):
         idx = st.top + i
         health = drv.health or "?"
         model = drv.model if not drv.error else f"({drv.error})"
         row = (
-            f"{drv.name:<14}  {(drv.dtype or '-'):<7}  {model[:model_w]:<{model_w}}  "
+            f"{drv.name[:14]:<14}  {(drv.dtype or '-'):<{type_w}}  {model[:model_w]:<{model_w}}  "
             f"{drv.serial[:20]:<20}  {human_bytes(drv.size) if drv.size else '-':>10}  "
         )
         attr = curses.A_REVERSE if idx == st.sel else 0
