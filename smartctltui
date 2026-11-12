@@ -37,10 +37,16 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+# One display line: (style name or None, text).
+Line = tuple[str | None, str]
+Lines = list[Line]
 
 APP_NAME = "smartctltui"
 APP_VERSION = "v1.0.0"
@@ -73,7 +79,7 @@ BOX_TL, BOX_TR, BOX_BL, BOX_BR, BOX_H, BOX_V = "+", "+", "+", "+", "-", "|"
 BLOCKS = " *"
 
 
-def supports_unicode():
+def supports_unicode() -> bool:
     """Check whether the terminal can render box-drawing characters.
 
     Returns
@@ -84,7 +90,7 @@ def supports_unicode():
     return "utf" in (locale.getpreferredencoding(False) or "").lower()
 
 
-def setup_glyphs():
+def setup_glyphs() -> None:
     """Switch to Unicode box/block glyphs if the terminal can show them.
 
     Modifies the module-level glyph constants in place.
@@ -131,7 +137,7 @@ class Drive:
     health: str | None = None
     error: str | None = None
 
-    def args(self):
+    def args(self) -> list[str]:
         """Return the smartctl arguments that address this drive.
 
         Returns
@@ -161,7 +167,7 @@ class DriveData:
     fetched: float = field(default_factory=time.time)
 
 
-def smartctl_json(args, timeout=FETCH_TIMEOUT):
+def smartctl_json(args: list[str], timeout: float = FETCH_TIMEOUT) -> tuple[dict | None, subprocess.CompletedProcess]:
     """Run ``smartctl -j <args>`` and parse its JSON output.
 
     smartctl signals warnings through exit-status bits while still emitting
@@ -189,7 +195,7 @@ def smartctl_json(args, timeout=FETCH_TIMEOUT):
     return data, proc
 
 
-def messages_of(data):
+def messages_of(data: dict) -> list[str]:
     """Return the smartctl messages of a JSON document.
 
     Parameters
@@ -205,7 +211,7 @@ def messages_of(data):
     return [m.get("string", "") for m in get(data, "smartctl", "messages", default=[]) if isinstance(m, dict)]
 
 
-def failure_text(data, proc):
+def failure_text(data: dict | None, proc: subprocess.CompletedProcess) -> str:
     """Explain why a smartctl call produced no usable information.
 
     Parameters
@@ -226,7 +232,7 @@ def failure_text(data, proc):
     return (proc.stderr or proc.stdout or f"smartctl exited with status {proc.returncode}").strip()
 
 
-def fill_summary(drive):
+def fill_summary(drive: Drive) -> Drive:
     """Populate a drive's list-view fields from ``smartctl -i -H``.
 
     Parameters
@@ -257,7 +263,7 @@ def fill_summary(drive):
     return drive
 
 
-def scan_drives():
+def scan_drives() -> list[Drive]:
     """Discover drives with ``smartctl --scan`` and summarise each one.
 
     Returns
@@ -278,7 +284,7 @@ def scan_drives():
         return list(pool.map(fill_summary, drives))
 
 
-def fetch_drive(drive):
+def fetch_drive(drive: Drive) -> DriveData:
     """Fetch everything smartctl knows about a drive (``-x``) as JSON.
 
     Parameters
@@ -300,7 +306,7 @@ def fetch_drive(drive):
     return DriveData(json=data)
 
 
-def fetch_raw(drive):
+def fetch_raw(drive: Drive) -> str:
     """Return the plain-text ``smartctl -x`` report for a drive.
 
     Parameters
@@ -319,7 +325,7 @@ def fetch_raw(drive):
     return proc.stdout or proc.stderr
 
 
-def run_action(drive, args):
+def run_action(drive: Drive, args: list[str]) -> tuple[bool, str]:
     """Run a state-changing smartctl command.
 
     Parameters
@@ -356,7 +362,7 @@ def run_action(drive, args):
 # --------------------------------------------------------------------------
 
 
-def get(obj, *path, default=None):
+def get(obj: Any, *path: str | int, default: Any = None) -> Any:
     """Safely walk nested dicts/lists.
 
     Parameters
@@ -385,7 +391,7 @@ def get(obj, *path, default=None):
     return obj
 
 
-def human_bytes(n):
+def human_bytes(n: int | float) -> str:
     """Format a byte count with decimal units, like smartctl does.
 
     Parameters
@@ -406,7 +412,7 @@ def human_bytes(n):
     return ""
 
 
-def fmt_hours(hours):
+def fmt_hours(hours: int | float) -> str:
     """Format power-on hours as ``12,345 h (1y 15d 9h)``.
 
     Parameters
@@ -426,7 +432,7 @@ def fmt_hours(hours):
     return f"{hours:,} h ({' '.join(parts)})"
 
 
-def fmt_scalar(value):
+def fmt_scalar(value: Any) -> str:
     """Render a JSON scalar for display.
 
     Parameters
@@ -446,7 +452,7 @@ def fmt_scalar(value):
     return str(value)
 
 
-def flatten(obj, prefix=""):
+def flatten(obj: Any, prefix: str = "") -> list[tuple[str, str]]:
     """Flatten nested JSON to ``(dotted.key, text)`` pairs.
 
     Dicts of the form ``{value, string}`` collapse to the string.
@@ -481,7 +487,7 @@ def flatten(obj, prefix=""):
     return out
 
 
-def section(lines, title):
+def section(lines: Lines, title: str) -> None:
     """Start a titled section, separated from the previous one by a blank line.
 
     Parameters
@@ -496,7 +502,7 @@ def section(lines, title):
     lines.append(("head", title))
 
 
-def kv(lines, key, value, style=None, width=28):
+def kv(lines: Lines, key: str, value: Any, style: str | None = None, width: int = 28) -> None:
     """Append a ``key: value`` row unless the value is missing.
 
     Parameters
@@ -517,7 +523,7 @@ def kv(lines, key, value, style=None, width=28):
     lines.append((style, f"{key + ':':<{width}} {value}"))
 
 
-def kv_flat(lines, obj, width=34, indent=""):
+def kv_flat(lines: Lines, obj: Any, width: int = 34, indent: str = "") -> None:
     """Append every leaf of ``obj`` as an aligned key/value row.
 
     Parameters
@@ -535,7 +541,7 @@ def kv_flat(lines, obj, width=34, indent=""):
         lines.append((None, f"{indent}{key + ':':<{width}} {val}"))
 
 
-def fmt_table(headers, rows, aligns=None):
+def fmt_table(headers: list[str], rows: list[tuple], aligns: list[str] | None = None) -> tuple[str, list[str]]:
     """Align a table.
 
     Parameters
@@ -556,7 +562,7 @@ def fmt_table(headers, rows, aligns=None):
     """
     widths = [max(len(str(r[i])) for r in [headers] + rows) for i in range(len(headers))]
 
-    def fmt(row):
+    def fmt(row: Iterable[Any]) -> str:
         cells = [
             str(c).rjust(widths[i]) if aligns and aligns[i] == "r" else str(c).ljust(widths[i])
             for i, c in enumerate(row)
@@ -566,7 +572,7 @@ def fmt_table(headers, rows, aligns=None):
     return fmt(headers), [fmt(r) for r in rows]
 
 
-def not_available(lines, what="Not available for this drive."):
+def not_available(lines: Lines, what: str = "Not available for this drive.") -> None:
     """Append a dimmed placeholder row.
 
     Parameters
@@ -579,7 +585,7 @@ def not_available(lines, what="Not available for this drive."):
     lines.append(("dim", what))
 
 
-def is_nvme(d):
+def is_nvme(d: dict) -> bool:
     """Check whether the JSON describes an NVMe device.
 
     Parameters
@@ -595,7 +601,7 @@ def is_nvme(d):
     return get(d, "device", "protocol") == "NVMe" or "nvme_smart_health_information_log" in d
 
 
-def is_ata(d):
+def is_ata(d: dict) -> bool:
     """Check whether the JSON describes an ATA/SATA device.
 
     Parameters
@@ -616,7 +622,7 @@ def is_ata(d):
 # --------------------------------------------------------------------------
 
 
-def build_general(d, _width):
+def build_general(d: dict, _width: int) -> Lines:
     """Build the General tab: health verdict plus identity, capabilities and usage.
 
     Parameters
@@ -706,7 +712,7 @@ def build_general(d, _width):
     return lines
 
 
-def attr_style(attr):
+def attr_style(attr: dict) -> str | None:
     """Choose a display style for an ATA attribute row.
 
     Parameters
@@ -730,7 +736,7 @@ def attr_style(attr):
     return None
 
 
-def build_attributes(d, _width):
+def build_attributes(d: dict, _width: int) -> Lines:
     """Build the Attributes tab: ATA attribute table, NVMe health log, or SCSI logs.
 
     Parameters
@@ -803,7 +809,7 @@ def build_attributes(d, _width):
 SCSI_IDENTITY = {"scsi_vendor", "scsi_product", "scsi_model_name", "scsi_revision", "scsi_version"}
 
 
-def build_statistics(d, _width):
+def build_statistics(d: dict, _width: int) -> Lines:
     """Build the Statistics tab: ATA device statistics pages, or derived NVMe usage figures.
 
     Parameters
@@ -864,7 +870,7 @@ def build_statistics(d, _width):
     return lines
 
 
-def self_test_style(passed, text):
+def self_test_style(passed: bool | None, text: str) -> str:
     """Style a self-test result row.
 
     Parameters
@@ -886,7 +892,7 @@ def self_test_style(passed, text):
     return "bad"
 
 
-def build_selftests(d, _width):
+def build_selftests(d: dict, _width: int) -> Lines:
     """Build the Self-Tests tab: current progress, expected durations, and the test log.
 
     Parameters
@@ -965,7 +971,7 @@ def build_selftests(d, _width):
     return lines
 
 
-def build_errors(d, _width):
+def build_errors(d: dict, _width: int) -> Lines:
     """Build the Error Log tab: ATA error log entries or the NVMe error information log.
 
     Parameters
@@ -1011,7 +1017,7 @@ def build_errors(d, _width):
     return lines
 
 
-def chart_rows(values, width, height=8):
+def chart_rows(values: list[float], width: int, height: int = 8) -> tuple[list[str], float, float]:
     """Render values as a filled bar chart.
 
     Parameters
@@ -1051,7 +1057,7 @@ def chart_rows(values, width, height=8):
     return rows, lo, hi
 
 
-def build_temperature(d, width):
+def build_temperature(d: dict, width: int) -> Lines:
     """Build the Temperature tab: current readings, limits and the SCT history chart.
 
     Parameters
@@ -1162,7 +1168,7 @@ HANDLED_KEYS = {
 }
 
 
-def build_advanced(d, _width):
+def build_advanced(d: dict, _width: int) -> Lines:
     """Build the Advanced tab: smartctl diagnostics plus every section not shown elsewhere.
 
     Parameters
@@ -1199,7 +1205,7 @@ def build_advanced(d, _width):
     return lines
 
 
-def build_raw(text, _width):
+def build_raw(text: str | None, _width: int) -> Lines:
     """Build the Raw tab: the unmodified text output of ``smartctl -x``.
 
     Parameters
@@ -1259,13 +1265,19 @@ class Job:
         Whether the job has finished.
     """
 
-    def __init__(self, message, func, on_done=None, blocking=False):
+    def __init__(
+        self,
+        message: str,
+        func: Callable[[], Any],
+        on_done: Callable[["Job"], None] | None = None,
+        blocking: bool = False,
+    ) -> None:
         self.message, self.on_done, self.blocking = message, on_done, blocking
         self.result = self.error = None
         self.done = False
         threading.Thread(target=self._run, args=(func,), daemon=True).start()
 
-    def _run(self, func):
+    def _run(self, func: Callable[[], Any]) -> None:
         try:
             self.result = func()
         except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -1337,7 +1349,7 @@ class AppState:
     cache_key: tuple = ()
     cache_lines: list = field(default_factory=list)
 
-    def set_status(self, text, style=None):
+    def set_status(self, text: str, style: str | None = None) -> None:
         """Show a transient message in the status line.
 
         Parameters
@@ -1349,7 +1361,7 @@ class AppState:
         """
         self.status, self.status_style, self.status_time = text, style, time.time()
 
-    def lines(self, width):
+    def lines(self, width: int) -> Lines:
         """Return (cached) display lines for the current tab.
 
         Parameters
@@ -1377,7 +1389,7 @@ class AppState:
             self.cache_key, self.cache_lines = key, built
         return self.cache_lines
 
-    def test_running(self):
+    def test_running(self) -> bool:
         """Check whether the drive reports a self-test in progress.
 
         Returns
@@ -1391,7 +1403,7 @@ class AppState:
         return bool(get(d, "nvme_self_test_log", "current_self_test_operation", "value", default=0))
 
 
-def start_refresh(st, quiet=False):
+def start_refresh(st: AppState, quiet: bool = False) -> None:
     """Begin a non-blocking reload of the current drive's data.
 
     The raw text is reloaded too if it was already loaded.
@@ -1407,10 +1419,10 @@ def start_refresh(st, quiet=False):
         return
     drive, want_raw = st.drive, st.raw is not None or st.tab == RAW_TAB
 
-    def work():
+    def work() -> tuple[DriveData, str | None]:
         return fetch_drive(drive), (fetch_raw(drive) if want_raw else None)
 
-    def done(job):
+    def done(job: Job) -> None:
         if st.drive is not drive:
             return
         if job.error:
@@ -1425,7 +1437,9 @@ def start_refresh(st, quiet=False):
     st.job = Job(f"Reading {drive.name}", work, done)
 
 
-def run_blocking(stdscr, st, message, func):
+def run_blocking(
+    stdscr: curses.window, st: AppState, message: str, func: Callable[[], Any]
+) -> tuple[Any, Exception | None]:
     """Run a function in a thread while animating a spinner.
 
     Parameters
@@ -1457,7 +1471,7 @@ def run_blocking(stdscr, st, message, func):
     return job.result, job.error
 
 
-def tick(st):
+def tick(st: AppState) -> None:
     """Do per-frame housekeeping: finish jobs, expire status, auto-poll running tests.
 
     Parameters
@@ -1486,7 +1500,7 @@ def tick(st):
 # --------------------------------------------------------------------------
 
 
-def put(win, y, x, text, attr=0, maxw=None):
+def put(win: curses.window, y: int, x: int, text: str, attr: int = 0, maxw: int | None = None) -> None:
     """Call ``addnstr`` without ever raising on edge/overflow.
 
     Parameters
@@ -1512,7 +1526,7 @@ def put(win, y, x, text, attr=0, maxw=None):
         pass
 
 
-def style_attr(style):
+def style_attr(style: str | None) -> int:
     """Map a line style name to a curses attribute.
 
     Parameters
@@ -1532,7 +1546,7 @@ def style_attr(style):
     return base
 
 
-def draw_panel_border(win, y, x, height, width, title=None):
+def draw_panel_border(win: curses.window, y: int, x: int, height: int, width: int, title: str | None = None) -> None:
     """Draw a rounded box with an optional title embedded in the top edge.
 
     Parameters
@@ -1555,7 +1569,7 @@ def draw_panel_border(win, y, x, height, width, title=None):
     put(win, y + height - 1, x, BOX_BL + BOX_H * (width - 2) + BOX_BR, 0, width)
 
 
-def draw_chrome(win, st, title_right):
+def draw_chrome(win: curses.window, st: AppState, title_right: str | None) -> tuple[int, int]:
     """Draw the title bar, status line and key hint.
 
     Parameters
@@ -1592,7 +1606,7 @@ def draw_chrome(win, st, title_right):
     return h, w
 
 
-def draw_drives(win, st):
+def draw_drives(win: curses.window, st: AppState) -> None:
     """Draw the drive selection list.
 
     Parameters
@@ -1632,7 +1646,7 @@ def draw_drives(win, st):
         put(win, 3 + i, hx, f"{health:<7}", style_attr(hstyle) | attr, w - hx - 1)
 
 
-def draw_drive(win, st):
+def draw_drive(win: curses.window, st: AppState) -> None:
     """Draw the per-drive tabbed view.
 
     Parameters
@@ -1664,7 +1678,7 @@ def draw_drive(win, st):
         put(win, 2 + height - 1, max(w - len(info) - 2, 1), info, ATTRS["dim"])
 
 
-def draw(win, st):
+def draw(win: curses.window, st: AppState) -> None:
     """Redraw the whole screen for the current view.
 
     Parameters
@@ -1684,7 +1698,7 @@ def draw(win, st):
 # --------------------------------------------------------------------------
 
 
-def read_key(win):
+def read_key(win: curses.window) -> str | int | None:
     """Read one key.
 
     Parameters
@@ -1703,7 +1717,7 @@ def read_key(win):
         return None
 
 
-def is_enter(k):
+def is_enter(k: str | int | None) -> bool:
     """Check whether a key is any Enter key.
 
     Parameters
@@ -1719,7 +1733,7 @@ def is_enter(k):
     return k in ("\n", "\r", curses.KEY_ENTER)
 
 
-def popup_box(win, title, height, width):
+def popup_box(win: curses.window, title: str, height: int, width: int) -> tuple[int, int]:
     """Clear and frame a centered popup.
 
     Parameters
@@ -1747,7 +1761,7 @@ def popup_box(win, title, height, width):
     return y, x
 
 
-def popup_menu(win, title, items):
+def popup_menu(win: curses.window, title: str, items: list[tuple[str, bool]]) -> int | None:
     """Show a selectable menu.
 
     Parameters
@@ -1786,7 +1800,7 @@ def popup_menu(win, title, items):
             return sel
 
 
-def popup_text(win, title, default=""):
+def popup_text(win: curses.window, title: str, default: str = "") -> str | None:
     """Show a single-line text editor.
 
     Parameters
@@ -1846,7 +1860,7 @@ def popup_text(win, title, default=""):
         curses.curs_set(0)
 
 
-def popup_message(win, title, lines, prompt="Press any key"):
+def popup_message(win: curses.window, title: str, lines: list[str], prompt: str = "Press any key") -> str | int:
     """Show a message box and wait for a key.
 
     Parameters
@@ -1878,7 +1892,7 @@ def popup_message(win, title, lines, prompt="Press any key"):
             return k
 
 
-def popup_confirm(win, message):
+def popup_confirm(win: curses.window, message: str) -> bool:
     """Ask a yes/no question.
 
     Parameters
@@ -1914,7 +1928,7 @@ HELP_LINES = [
 # --------------------------------------------------------------------------
 
 
-def invoking_user():
+def invoking_user() -> tuple[Path, int | None, int | None]:
     """Find the user who started us, even through sudo.
 
     Returns
@@ -1936,7 +1950,7 @@ def invoking_user():
     return Path.home(), None, None
 
 
-def reload_after_action(stdscr, st):
+def reload_after_action(stdscr: curses.window, st: AppState) -> None:
     """Fetch fresh data synchronously after an action changed drive state.
 
     Parameters
@@ -1953,7 +1967,7 @@ def reload_after_action(stdscr, st):
         st.data = data
 
 
-def test_menu(stdscr, st):
+def test_menu(stdscr: curses.window, st: AppState) -> None:
     """Offer self-tests and SMART switches for the open drive.
 
     Parameters
@@ -2007,7 +2021,7 @@ def test_menu(stdscr, st):
         st.tab = TABS.index("Self-Tests") if args.startswith("-t") else st.tab
 
 
-def safe_name(text):
+def safe_name(text: str) -> str:
     """Make text safe for use in a filename.
 
     Parameters
@@ -2023,7 +2037,7 @@ def safe_name(text):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_") or "drive"
 
 
-def save_menu(stdscr, st):
+def save_menu(stdscr: curses.window, st: AppState) -> None:
     """Save the current tab, full text report, or full JSON to a file.
 
     Parameters
@@ -2088,7 +2102,7 @@ def save_menu(stdscr, st):
     st.set_status(f"Saved {path}", "good")
 
 
-def open_device(stdscr, st):
+def open_device(stdscr: curses.window, st: AppState) -> None:
     """Prompt for a device path and add it to the list.
 
     The path may be followed by ``-d type``.
@@ -2129,7 +2143,7 @@ def open_device(stdscr, st):
         st.set_status(f"{name}: {drive.error}", "bad")
 
 
-def rescan(stdscr, st):
+def rescan(stdscr: curses.window, st: AppState) -> None:
     """Rediscover drives.
 
     Parameters
@@ -2146,7 +2160,7 @@ def rescan(stdscr, st):
     st.drives, st.sel = drives, 0
 
 
-def open_drive(stdscr, st):
+def open_drive(stdscr: curses.window, st: AppState) -> None:
     """Enter the tabbed view for the selected drive.
 
     Parameters
@@ -2168,7 +2182,7 @@ def open_drive(stdscr, st):
 # --------------------------------------------------------------------------
 
 
-def handle_drives_key(stdscr, st, k):
+def handle_drives_key(stdscr: curses.window, st: AppState, k: str | int) -> bool:
     """Handle a key in the drive list.
 
     Parameters
@@ -2211,7 +2225,7 @@ def handle_drives_key(stdscr, st, k):
     return True
 
 
-def handle_drive_key(stdscr, st, k):
+def handle_drive_key(stdscr: curses.window, st: AppState, k: str | int) -> None:
     """Handle a key in the drive view.
 
     Parameters
@@ -2273,7 +2287,7 @@ def handle_drive_key(stdscr, st, k):
     st.scroll[st.tab] = max(0, min(scroll, last))
 
 
-def init_colors():
+def init_colors() -> None:
     """Follow the terminal theme; add green/yellow/red for status only."""
     try:
         curses.start_color()
@@ -2288,7 +2302,7 @@ def init_colors():
         pass
 
 
-def main(stdscr, out_dir):
+def main(stdscr: curses.window, out_dir: Path) -> None:
     """Run the app's main event loop.
 
     Parameters
@@ -2317,7 +2331,7 @@ def main(stdscr, out_dir):
             handle_drive_key(stdscr, st, k)
 
 
-def ensure_root(argv):
+def ensure_root(argv: list[str]) -> None:
     """Re-run under sudo when not root (smartctl needs it to open drives).
 
     Parameters
