@@ -2366,6 +2366,13 @@ if __name__ == "__main__":
     if not args.no_sudo:
         ensure_root(sys.argv[1:])
 
+    try:
+        curses.setupterm()
+    except curses.error:
+        # Unknown TERM on this host (e.g. "foot" without its terminfo entry installed).
+        print(f"Warning: no terminfo entry for TERM={os.environ.get('TERM')}; using xterm-256color.", file=sys.stderr)
+        os.environ["TERM"] = "xterm-256color"
+
     setup_glyphs()
     try:
         curses.wrapper(main, (args.output_dir or invoking_user()[0]).expanduser())
