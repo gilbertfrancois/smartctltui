@@ -1,0 +1,1422 @@
+#!/usr/bin/env python3
+
+# Copyright 2026 Gilbert Francois Duivesteijn
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+
+"""
+smartctltui is a terminal (curses) front-end for smartmontools' smartctl,
+modelled on GSmartControl. Pick a drive, then browse General, Attributes,
+Statistics, Self-Tests, Error Log, Temperature, Advanced and Raw views,
+start or abort self-tests, and save any report to disk.
+
+Navigate with vim-style h/l (tabs), j/k/gg/G (scroll), Enter to open a drive,
+t for tests, s to save, r to refresh, ? for help.
+"""
+
+import argparse
+import curses
+import json
+import locale
+import os
+import pwd
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+APP_NAME = "smartctltui"
+APP_VERSION = "v0.1.0"
+APP_BRAND = f"{APP_NAME} {APP_VERSION}"
+
+# SMARTCTLTUI_SMARTCTL lets tests substitute a fake smartctl (may contain arguments).
+SMARTCTL_CMD = shlex.split(os.environ.get("SMARTCTLTUI_SMARTCTL", "smartctl"))
+
+PAIR_DIM, PAIR_GOOD, PAIR_BAD, PAIR_WARN = 1, 2, 3, 4
+COLOR_BRIGHT_BLACK = 8
+ATTRS = {"dim": curses.A_DIM, "good": 0, "bad": curses.A_BOLD, "warn": 0, "head": curses.A_BOLD}
+
+TABS = ["General", "Attributes", "Statistics", "Self-Tests", "Error Log", "Temperature", "Advanced", "Raw"]
+RAW_TAB = TABS.index("Raw")
+
+SPINNER = "|/-\\"
+STATUS_TTL = 8.0
+POLL_SECONDS = 5.0
+FETCH_TIMEOUT = 180
+
+EXIT_BITS = {
+    3: ("bad", "SMART status check returned DISK FAILING"),
+    4: ("bad", "Prefail attributes are at or below threshold NOW"),
+    5: ("warn", "Prefail attributes were at or below threshold in the past"),
+    6: ("warn", "The device error log contains records of errors"),
+    7: ("warn", "The device self-test log contains records of errors"),
+}
+
+BOX_TL, BOX_TR, BOX_BL, BOX_BR, BOX_H, BOX_V = "+", "+", "+", "+", "-", "|"
+BLOCKS = " *"
+
+
+def supports_unicode():
+    """Return True when the locale encoding can render box-drawing characters."""
+    return "utf" in (locale.getpreferredencoding(False) or "").lower()
+
+
+def setup_glyphs():
+    """Switch to Unicode box/block glyphs if the terminal can show them."""
+    global BOX_TL, BOX_TR, BOX_BL, BOX_BR, BOX_H, BOX_V, BLOCKS, SPINNER
+    if supports_unicode():
+        BOX_TL, BOX_TR, BOX_BL, BOX_BR, BOX_H, BOX_V = "╭", "╮", "╰", "╯", "─", "│"
+        BLOCKS = " ▁▂▃▄▅▆▇█"
+        SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+# --------------------------------------------------------------------------
+# smartctl access
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Drive:
+    """A drive known to the app, plus the summary shown in the drive list."""
+
+    name: str
+    dtype: str | None = None
+    model: str = ""
+    serial: str = ""
+    size: int = 0
+    health: str | None = None
+    error: str | None = None
+
+    def args(self):
+        """Return the smartctl arguments that address this drive."""
+        return ["-d", self.dtype, self.name] if self.dtype else [self.name]
+
+
+@dataclass
+class DriveData:
+    """Result of one full smartctl query of a drive."""
+
+    json: dict | None = None
+    error: str | None = None
+    fetched: float = field(default_factory=time.time)
+
+
+def smartctl_json(args, timeout=FETCH_TIMEOUT):
+    """Run ``smartctl -j <args>``; return (parsed JSON or None, CompletedProcess).
+
+    smartctl signals warnings through exit-status bits while still emitting
+    valid JSON, so the output is parsed regardless of the return code.
+    """
+    proc = subprocess.run(SMARTCTL_CMD + ["-j"] + args, capture_output=True, text=True, timeout=timeout, check=False)
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        data = None
+    return data, proc
+
+
+def messages_of(data):
+    """Return the smartctl messages of a JSON document as a list of strings."""
+    return [m.get("string", "") for m in get(data, "smartctl", "messages", default=[]) if isinstance(m, dict)]
+
+
+def failure_text(data, proc):
+    """Explain why a smartctl call produced no usable information."""
+    msgs = messages_of(data) if data else []
+    if msgs:
+        return "; ".join(msgs)
+    return (proc.stderr or proc.stdout or f"smartctl exited with status {proc.returncode}").strip()
+
+
+def fill_summary(drive):
+    """Populate a drive's list-view fields from ``smartctl -i -H``."""
+    try:
+        data, proc = smartctl_json(["-i", "-H"] + drive.args(), timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        drive.error = str(exc)
+        return drive
+    if not data or "device" not in data and "model_name" not in data and "scsi_product" not in data:
+        drive.error = failure_text(data, proc)
+        return drive
+    drive.model = (
+        data.get("model_name")
+        or " ".join(filter(None, [data.get("scsi_vendor"), data.get("scsi_product")]))
+        or ""
+    )
+    drive.serial = data.get("serial_number", "")
+    drive.size = get(data, "user_capacity", "bytes", default=0) or get(data, "nvme_total_capacity", default=0)
+    passed = get(data, "smart_status", "passed")
+    drive.health = None if passed is None else ("PASSED" if passed else "FAILED")
+    return drive
+
+
+def scan_drives():
+    """Discover drives with ``smartctl --scan`` and summarise each one."""
+    data, proc = smartctl_json(["--scan"], timeout=60)
+    if data is None:
+        raise RuntimeError(failure_text(data, proc))
+    drives = [Drive(d["name"], d.get("type")) for d in data.get("devices", [])]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(fill_summary, drives))
+
+
+def fetch_drive(drive):
+    """Fetch everything smartctl knows about a drive (``-x``) as JSON."""
+    try:
+        data, proc = smartctl_json(["-x"] + drive.args())
+    except (OSError, subprocess.SubprocessError) as exc:
+        return DriveData(error=str(exc))
+    if data is None:
+        return DriveData(error=failure_text(data, proc))
+    return DriveData(json=data)
+
+
+def fetch_raw(drive):
+    """Return the plain-text ``smartctl -x`` report for a drive."""
+    proc = subprocess.run(
+        SMARTCTL_CMD + ["-x"] + drive.args(), capture_output=True, text=True, timeout=FETCH_TIMEOUT, check=False
+    )
+    return proc.stdout or proc.stderr
+
+
+def run_action(drive, args):
+    """Run a state-changing smartctl command; return (ok, message)."""
+    try:
+        data, proc = smartctl_json(args + drive.args(), timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    msgs = messages_of(data) if data else []
+    # Exit-status bits 0-2 mean the command itself failed.
+    ok = data is not None and proc.returncode & 0b111 == 0
+    if not ok:
+        return False, failure_text(data, proc)
+    text = next((m for m in msgs if "wait" in m.lower() or "started" in m.lower()), "")
+    if not text and data is not None:
+        text = "Command completed"
+    return True, text
+
+
+# --------------------------------------------------------------------------
+# JSON helpers and formatting
+# --------------------------------------------------------------------------
+
+
+def get(obj, *path, default=None):
+    """Safely walk nested dicts/lists; return ``default`` if any step is missing."""
+    for key in path:
+        if isinstance(obj, dict):
+            obj = obj.get(key)
+        elif isinstance(obj, list) and isinstance(key, int) and -len(obj) <= key < len(obj):
+            obj = obj[key]
+        else:
+            return default
+        if obj is None:
+            return default
+    return obj
+
+
+def human_bytes(n):
+    """Format a byte count with decimal units, like smartctl does."""
+    n = float(n)
+    for unit in ("B", "kB", "MB", "GB", "TB", "PB"):
+        if n < 1000 or unit == "PB":
+            return f"{n:.0f} B" if unit == "B" else f"{n:.2f} {unit}"
+        n /= 1000
+    return ""
+
+
+def fmt_hours(hours):
+    """Format power-on hours as ``12,345 h (1y 15d 9h)``."""
+    hours = int(hours)
+    days, hrs = divmod(hours, 24)
+    years, days = divmod(days, 365)
+    parts = ([f"{years}y"] if years else []) + ([f"{days}d"] if days or years else []) + [f"{hrs}h"]
+    return f"{hours:,} h ({' '.join(parts)})"
+
+
+def fmt_scalar(value):
+    """Render a JSON scalar for display."""
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def flatten(obj, prefix=""):
+    """Flatten nested JSON to ``(dotted.key, text)`` pairs; ``{value, string}`` dicts collapse to the string."""
+    out = []
+    if isinstance(obj, dict):
+        if "string" in obj and len(obj) <= 3:
+            out.append((prefix, fmt_scalar(obj["string"])))
+            return out
+        for key, val in obj.items():
+            out += flatten(val, f"{prefix}.{key}" if prefix else str(key))
+    elif isinstance(obj, list):
+        if all(not isinstance(x, (dict, list)) for x in obj):
+            out.append((prefix, ", ".join(map(fmt_scalar, obj)) if len(obj) <= 24 else f"{len(obj)} values"))
+        else:
+            for i, item in enumerate(obj):
+                out += flatten(item, f"{prefix}[{i}]")
+    else:
+        out.append((prefix, fmt_scalar(obj)))
+    return out
+
+
+def section(lines, title):
+    """Start a titled section, separated from the previous one by a blank line."""
+    if lines:
+        lines.append((None, ""))
+    lines.append(("head", title))
+
+
+def kv(lines, key, value, style=None, width=28):
+    """Append a ``key: value`` row unless the value is missing."""
+    if value is None or value == "":
+        return
+    lines.append((style, f"{key + ':':<{width}} {value}"))
+
+
+def kv_flat(lines, obj, width=34, indent=""):
+    """Append every leaf of ``obj`` as an aligned key/value row."""
+    for key, val in flatten(obj):
+        lines.append((None, f"{indent}{key + ':':<{width}} {val}"))
+
+
+def fmt_table(headers, rows, aligns=None):
+    """Align a table; return (header line, [row lines])."""
+    widths = [max(len(str(r[i])) for r in [headers] + rows) for i in range(len(headers))]
+
+    def fmt(row):
+        cells = [
+            str(c).rjust(widths[i]) if aligns and aligns[i] == "r" else str(c).ljust(widths[i])
+            for i, c in enumerate(row)
+        ]
+        return "  ".join(cells).rstrip()
+
+    return fmt(headers), [fmt(r) for r in rows]
+
+
+def not_available(lines, what="Not available for this drive."):
+    """Append a dimmed placeholder row."""
+    lines.append(("dim", what))
+
+
+def is_nvme(d):
+    """Return True if the JSON describes an NVMe device."""
+    return get(d, "device", "protocol") == "NVMe" or "nvme_smart_health_information_log" in d
+
+
+def is_ata(d):
+    """Return True if the JSON describes an ATA/SATA device."""
+    return "ata_smart_attributes" in d or get(d, "device", "protocol") == "ATA"
+
+
+# --------------------------------------------------------------------------
+# Tab content builders. Each returns a list of (style, text) lines.
+# --------------------------------------------------------------------------
+
+
+def build_general(d, _width):
+    """General: health verdict plus identity, capabilities and usage."""
+    lines = []
+    passed = get(d, "smart_status", "passed")
+    section(lines, "Overall health")
+    if passed is None:
+        lines.append(("warn", "SMART health status: unknown"))
+    elif passed:
+        lines.append(("good", "SMART overall-health self-assessment: PASSED"))
+    else:
+        lines.append(("bad", "SMART overall-health self-assessment: FAILED!"))
+    status = get(d, "smartctl", "exit_status", default=0)
+    for bit, (style, text) in EXIT_BITS.items():
+        if status & (1 << bit):
+            lines.append((style, f"! {text}"))
+    for msg in messages_of(d):
+        lines.append(("warn", f"smartctl: {msg}"))
+
+    section(lines, "Device")
+    kv(lines, "Model family", d.get("model_family"))
+    kv(lines, "Model", d.get("model_name") or " ".join(filter(None, [d.get("scsi_vendor"), d.get("scsi_product")])))
+    kv(lines, "Serial number", d.get("serial_number"))
+    wwn = d.get("wwn")
+    if wwn:
+        kv(lines, "WWN", f"{wwn.get('naa', '')} {wwn.get('oui', 0):06x} {wwn.get('id', 0):09x}")
+    kv(lines, "Firmware version", d.get("firmware_version") or d.get("scsi_revision"))
+    cap = get(d, "user_capacity", "bytes")
+    if cap:
+        kv(lines, "Capacity", f"{human_bytes(cap)} ({cap:,} bytes)")
+    kv(lines, "NVMe total capacity", human_bytes(d["nvme_total_capacity"]) if d.get("nvme_total_capacity") else None)
+    kv(lines, "NVMe unallocated", human_bytes(d["nvme_unallocated_capacity"]) if d.get("nvme_unallocated_capacity") is not None else None)
+    kv(lines, "Logical sector size", get(d, "logical_block_size"))
+    kv(lines, "Physical sector size", get(d, "physical_block_size"))
+    rot = d.get("rotation_rate")
+    if rot is not None:
+        kv(lines, "Rotation rate", "Solid state device" if rot == 0 else f"{rot} rpm")
+    kv(lines, "Form factor", get(d, "form_factor", "name"))
+    kv(lines, "Device node", get(d, "device", "name"))
+    kv(lines, "Protocol / type", f"{get(d, 'device', 'protocol', default='?')} / {get(d, 'device', 'type', default='?')}")
+    kv(lines, "ATA version", get(d, "ata_version", "string"))
+    kv(lines, "SATA version", get(d, "sata_version", "string"))
+    kv(lines, "Interface speed", get(d, "interface_speed", "current", "string"))
+    kv(lines, "TRIM supported", fmt_scalar(get(d, "trim", "supported")) if get(d, "trim") else None)
+    kv(lines, "NVMe version", get(d, "nvme_version", "string"))
+    kv(lines, "NVMe controller ID", d.get("nvme_controller_id"))
+    kv(lines, "NVMe namespaces", d.get("nvme_number_of_namespaces"))
+    kv(lines, "In smartctl database", fmt_scalar(d["in_smartctl_database"]) if "in_smartctl_database" in d else None)
+
+    section(lines, "SMART support")
+    avail, enabled = get(d, "smart_support", "available"), get(d, "smart_support", "enabled")
+    kv(lines, "SMART available", fmt_scalar(avail) if avail is not None else None)
+    kv(lines, "SMART enabled", fmt_scalar(enabled) if enabled is not None else None, None if enabled in (None, True) else "warn")
+
+    section(lines, "Usage")
+    poh = get(d, "power_on_time", "hours")
+    kv(lines, "Power-on time", fmt_hours(poh) if poh is not None else None)
+    kv(lines, "Power cycles", d.get("power_cycle_count"))
+    temp = get(d, "temperature", "current")
+    kv(lines, "Temperature", f"{temp} °C" if temp is not None else None)
+    used = get(d, "endurance_used", "current_percent")
+    kv(lines, "Endurance used", f"{used} %" if used is not None else None)
+    return lines
+
+
+def attr_style(attr):
+    """Choose a display style for an ATA attribute row."""
+    failed = attr.get("when_failed") or ""
+    if failed == "now":
+        return "bad"
+    if failed:
+        return "warn"
+    thresh = attr.get("thresh") or 0
+    if thresh and attr.get("value", 255) <= thresh:
+        return "bad"
+    return None
+
+
+def build_attributes(d, _width):
+    """Attributes: the ATA attribute table, NVMe health log, or SCSI logs."""
+    lines = []
+    table = get(d, "ata_smart_attributes", "table")
+    if table:
+        rows = []
+        for a in table:
+            rows.append(
+                (
+                    a.get("id"),
+                    a.get("name"),
+                    a.get("value"),
+                    a.get("worst"),
+                    a.get("thresh"),
+                    get(a, "raw", "string", default=get(a, "raw", "value", default="")),
+                    "Pre-fail" if get(a, "flags", "prefailure") else "Old_age",
+                    "Always" if get(a, "flags", "updated_online") else "Offline",
+                    a.get("when_failed") or "-",
+                )
+            )
+        head, body = fmt_table(
+            ["ID", "ATTRIBUTE", "VAL", "WORST", "THR", "RAW VALUE", "TYPE", "UPDATED", "FAILED"],
+            rows,
+            ["r", "l", "r", "r", "r", "l", "l", "l", "l"],
+        )
+        lines.append(("head", head))
+        for text, attr in zip(body, table):
+            lines.append((attr_style(attr), text))
+        lines += [(None, ""), ("dim", "Pre-fail attributes at/below THR indicate imminent failure; VAL/WORST are normalised.")]
+        return lines
+    log = d.get("nvme_smart_health_information_log")
+    if log:
+        section(lines, "NVMe SMART / Health Information")
+        warn = log.get("critical_warning", 0)
+        for key, val in flatten(log):
+            style = None
+            if key == "critical_warning" and warn:
+                style = "bad"
+            elif key == "media_errors" and val not in ("0", "-"):
+                style = "bad"
+            elif key == "percentage_used" and val.isdigit() and int(val) >= 90:
+                style = "bad"
+            elif key == "available_spare" and val.isdigit() and int(val) <= log.get("available_spare_threshold", 0):
+                style = "bad"
+            lines.append((style, f"{key + ':':<28} {val}"))
+        return lines
+    scsi = {k: v for k, v in d.items() if k.startswith("scsi_") and k not in SCSI_IDENTITY}
+    if scsi:
+        kv_flat(lines, scsi)
+        return lines
+    not_available(lines, "No SMART attributes reported by this drive.")
+    return lines
+
+
+SCSI_IDENTITY = {"scsi_vendor", "scsi_product", "scsi_model_name", "scsi_revision", "scsi_version"}
+
+
+def build_statistics(d, _width):
+    """Statistics: ATA device statistics pages, or derived NVMe usage figures."""
+    lines = []
+    pages = get(d, "ata_device_statistics", "pages")
+    if pages:
+        for page in pages:
+            section(lines, page.get("name", f"Page {page.get('number')}"))
+            for entry in page.get("table", []):
+                valid = get(entry, "flags", "valid", default=True)
+                val = entry.get("value") if valid else "n/a"
+                lines.append((None if valid else "dim", f"  {entry.get('name', '?') + ':':<40} {val}"))
+        return lines
+    log = d.get("nvme_smart_health_information_log")
+    if log:
+        unit = 512_000  # an NVMe "data unit" is 1000 * 512 bytes
+        section(lines, "Data transferred")
+        for label, key in (("Data read", "data_units_read"), ("Data written", "data_units_written")):
+            if key in log:
+                lines.append((None, f"  {label + ':':<28} {human_bytes(log[key] * unit)}"))
+        for label, key in (("Host read commands", "host_reads"), ("Host write commands", "host_writes")):
+            if key in log:
+                lines.append((None, f"  {label + ':':<28} {log[key]:,}"))
+        section(lines, "Wear and reliability")
+        for label, key, suffix in (
+            ("Percentage used", "percentage_used", " %"),
+            ("Available spare", "available_spare", " %"),
+            ("Available spare threshold", "available_spare_threshold", " %"),
+            ("Media and data integrity errors", "media_errors", ""),
+            ("Error log entries", "num_err_log_entries", ""),
+            ("Unsafe shutdowns", "unsafe_shutdowns", ""),
+        ):
+            if key in log:
+                lines.append((None, f"  {label + ':':<34} {log[key]:,}{suffix}"))
+        section(lines, "Time")
+        for label, key, suffix in (
+            ("Power-on hours", "power_on_hours", " h"),
+            ("Power cycles", "power_cycles", ""),
+            ("Controller busy time", "controller_busy_time", " min"),
+            ("Time above warning temp", "warning_temp_time", " min"),
+            ("Time above critical temp", "critical_comp_time", " min"),
+        ):
+            if key in log:
+                lines.append((None, f"  {label + ':':<34} {log[key]:,}{suffix}"))
+        return lines
+    not_available(lines, "No device statistics reported by this drive.")
+    return lines
+
+
+def self_test_style(passed, text):
+    """Style a self-test result row."""
+    if passed is True or text.lower().startswith("completed without"):
+        return "good"
+    if re.search(r"abort|interrupt|reset", text, re.I):
+        return "warn"
+    return "bad"
+
+
+def build_selftests(d, _width):
+    """Self-Tests: current test progress, expected durations, and the test log."""
+    lines = []
+    status = get(d, "ata_smart_data", "self_test", "status")
+    if status:
+        section(lines, "Current status")
+        pct = status.get("remaining_percent")
+        if pct is not None:
+            lines.append(("warn", f"Self-test in progress: {100 - pct}% done ({pct}% remaining)"))
+        else:
+            lines.append((None, status.get("string", "unknown")))
+        poll = get(d, "ata_smart_data", "self_test", "polling_minutes")
+        if poll:
+            section(lines, "Estimated duration")
+            for key, label in (("short", "Short"), ("extended", "Extended"), ("conveyance", "Conveyance")):
+                if key in poll:
+                    lines.append((None, f"  {label + ':':<14} {poll[key]} min"))
+    nv = d.get("nvme_self_test_log")
+    if nv:
+        section(lines, "Current status")
+        op = get(nv, "current_self_test_operation", "string", default="No self-test in progress")
+        pct = nv.get("current_self_test_completion_percent")
+        lines.append(("warn" if get(nv, "current_self_test_operation", "value", default=0) else None, f"{op}" + (f" ({pct}% complete)" if pct else "")))
+
+    rows, styles = [], []
+    ata = d.get("ata_smart_self_test_log")
+    if ata:
+        log = ata.get("extended") or ata.get("standard") or {}
+        for i, e in enumerate(log.get("table", []), 1):
+            res = get(e, "status", "string", default="?")
+            rows.append((f"# {i}", get(e, "type", "string", default="?"), res, e.get("lifetime_hours", "-"), e.get("lba", "-")))
+            styles.append(self_test_style(get(e, "status", "passed"), res))
+    if nv:
+        for i, e in enumerate(nv.get("table", []), 1):
+            res = get(e, "self_test_result", "string", default="?")
+            rows.append((f"# {i}", get(e, "self_test_code", "string", default="?"), res, e.get("power_on_hours", "-"), e.get("lba", "-")))
+            styles.append(self_test_style(None, res))
+    section(lines, "Self-test log (newest first)")
+    if rows:
+        head, body = fmt_table(["NUM", "TEST", "RESULT", "POWER-ON H", "LBA OF 1ST ERROR"], rows, ["r", "l", "l", "r", "r"])
+        lines.append(("dim", head))
+        lines += list(zip(styles, body))
+    elif ata or nv:
+        not_available(lines, "No self-tests have been logged.")
+    else:
+        not_available(lines, "Self-test log not supported by this drive.")
+    return lines
+
+
+def build_errors(d, _width):
+    """Error Log: ATA error log entries or the NVMe error information log."""
+    lines = []
+    ata = d.get("ata_smart_error_log")
+    if ata:
+        log = ata.get("extended") or ata.get("summary") or {}
+        count = log.get("count", 0)
+        section(lines, "ATA error log")
+        lines.append(("bad" if count else "good", f"Errors logged: {count}" if count else "No errors logged"))
+        for e in log.get("table", []):
+            section(lines, f"Error {e.get('error_number', '?')} at {e.get('lifetime_hours', '?')} h of power-on time")
+            rest = {k: v for k, v in e.items() if k not in ("error_number", "lifetime_hours", "previous_commands")}
+            kv_flat(lines, rest, indent="  ")
+            for cmd in e.get("previous_commands", []):
+                name = cmd.get("command_name") or get(cmd, "registers", "command", default="?")
+                lines.append(("dim", f"    preceding command: {name} @ {cmd.get('powerup_milliseconds', '?')} ms"))
+    nv = d.get("nvme_error_information_log")
+    if nv:
+        section(lines, "NVMe error information log")
+        table = nv.get("table", [])
+        lines.append(("bad" if nv.get("unread") else None, f"Entries read: {nv.get('read', 0)}, unread: {nv.get('unread', 0)}"))
+        for e in table:
+            section(lines, f"Error count {e.get('error_count', '?')}")
+            kv_flat(lines, e, indent="  ")
+        if not table:
+            lines.append(("good", "No errors logged"))
+    if not lines:
+        not_available(lines, "Error log not supported by this drive.")
+    return lines
+
+
+def chart_rows(values, width, height=8):
+    """Render ``values`` as a filled bar chart of ``height`` text rows."""
+    lo, hi = min(values), max(values)
+    span = max(hi - lo, 1)
+    cols = []
+    n = len(values)
+    for c in range(min(width, n)):
+        chunk = values[c * n // min(width, n) : max((c + 1) * n // min(width, n), c * n // min(width, n) + 1)]
+        cols.append(sum(chunk) / len(chunk))
+    levels = [1 + round((v - lo) / span * (height * 8 - 1)) for v in cols]
+    steps = len(BLOCKS) - 1
+    rows = []
+    for r in range(height - 1, -1, -1):
+        row = ""
+        for lv in levels:
+            eighths = max(0, min(8, lv - r * 8))
+            row += BLOCKS[round(eighths * steps / 8)]
+        rows.append(row)
+    return rows, lo, hi
+
+
+def build_temperature(d, width):
+    """Temperature: current readings, limits and the SCT history chart."""
+    lines = []
+    temp = get(d, "temperature", "current")
+    section(lines, "Current")
+    kv(lines, "Temperature", f"{temp} °C" if temp is not None else None)
+    for key, label in (("op_limit_max", "Warning threshold"), ("critical_limit_max", "Critical threshold")):
+        if get(d, "temperature", key) is not None and not is_ata(d):
+            kv(lines, label, f"{d['temperature'][key]} °C")
+    sct = get(d, "ata_sct_status", "temperature")
+    if sct:
+        for key, label in (
+            ("lifetime_min", "Lifetime minimum"),
+            ("lifetime_max", "Lifetime maximum"),
+            ("power_cycle_min", "Power cycle minimum"),
+            ("power_cycle_max", "Power cycle maximum"),
+            ("op_limit_max", "Operating limit (max)"),
+            ("limit_max", "Max limit"),
+            ("limit_min", "Min limit"),
+            ("under_over_limit_count", "Times over/under limit"),
+        ):
+            if key in sct:
+                kv(lines, label, f"{sct[key]}" + ("" if key.endswith("count") else " °C"))
+    log = d.get("nvme_smart_health_information_log")
+    if log:
+        for i, t in enumerate(log.get("temperature_sensors", []), 1):
+            kv(lines, f"Sensor {i}", f"{t} °C")
+        kv(lines, "Minutes above warning temp", log.get("warning_temp_time"))
+        kv(lines, "Minutes above critical temp", log.get("critical_comp_time"))
+    hist = d.get("ata_sct_temperature_history")
+    if hist and hist.get("table"):
+        table, idx = hist["table"], hist.get("index", 0)
+        ordered = table[idx + 1 :] + table[: idx + 1] if 0 <= idx < len(table) else table
+        values = [v for v in ordered if isinstance(v, (int, float)) and -100 < v < 200]
+        period = hist.get("logging_interval_minutes", hist.get("sampling_period_minutes", "?"))
+        section(lines, f"Temperature history ({len(values)} samples, one per {period} min, oldest at left)")
+        if values:
+            rows, lo, hi = chart_rows(values, max(10, width - 8))
+            for i, row in enumerate(rows):
+                label = f"{hi:>3.0f} " if i == 0 else (f"{lo:>3.0f} " if i == len(rows) - 1 else "    ")
+                lines.append((None, label + row))
+            lines.append(("dim", f"    min {min(values)} °C   max {max(values)} °C   avg {sum(values) / len(values):.1f} °C"))
+    elif not log and not sct:
+        not_available(lines, "No SCT temperature log available for this drive.")
+    return lines
+
+
+HANDLED_KEYS = {
+    "json_format_version", "smartctl", "local_time", "device", "model_name", "model_family", "serial_number",
+    "firmware_version", "user_capacity", "logical_block_size", "physical_block_size", "rotation_rate", "form_factor",
+    "wwn", "ata_version", "sata_version", "interface_speed", "trim", "nvme_version", "nvme_controller_id",
+    "nvme_number_of_namespaces", "in_smartctl_database", "smart_support", "smart_status", "power_on_time",
+    "power_cycle_count", "temperature", "ata_smart_attributes", "nvme_smart_health_information_log",
+    "ata_device_statistics", "ata_smart_self_test_log", "nvme_self_test_log", "ata_smart_error_log",
+    "nvme_error_information_log", "ata_sct_status", "ata_sct_temperature_history", "nvme_total_capacity",
+    "nvme_unallocated_capacity", "scsi_vendor", "scsi_product", "scsi_model_name", "scsi_revision",
+    "scsi_version", "nvme_pci_vendor", "nvme_ieee_oui_identifier",
+}
+
+
+def build_advanced(d, _width):
+    """Advanced: smartctl diagnostics plus every section not shown elsewhere."""
+    lines = []
+    section(lines, "smartctl")
+    ver = get(d, "smartctl", "version", default=[])
+    kv(lines, "Version", ".".join(map(str, ver)))
+    kv(lines, "Platform", get(d, "smartctl", "platform_info"))
+    status = get(d, "smartctl", "exit_status", default=0)
+    kv(lines, "Exit status", f"{status} (0b{status:08b})")
+    for bit, (style, text) in EXIT_BITS.items():
+        if status & (1 << bit):
+            lines.append((style, f"  bit {bit}: {text}"))
+    for msg in messages_of(d):
+        lines.append(("warn", f"  message: {msg}"))
+    vendor = d.get("nvme_pci_vendor")
+    if vendor:
+        section(lines, "NVMe PCI identity")
+        kv_flat(lines, {"nvme_pci_vendor": vendor, "ieee_oui": d.get("nvme_ieee_oui_identifier")})
+    for key in sorted(k for k in d if k not in HANDLED_KEYS):
+        section(lines, key)
+        kv_flat(lines, d[key], indent="  ")
+    return lines
+
+
+def build_raw(text, _width):
+    """Raw: the unmodified text output of ``smartctl -x``."""
+    if text is None:
+        return [("dim", "Loading smartctl output...")]
+    return [("head" if line.startswith("===") else None, line) for line in text.splitlines()]
+
+
+BUILDERS = [build_general, build_attributes, build_statistics, build_selftests, build_errors, build_temperature, build_advanced]
+
+
+# --------------------------------------------------------------------------
+# Application state, background jobs
+# --------------------------------------------------------------------------
+
+
+class Job:
+    """A function running in a worker thread, polled by the UI loop."""
+
+    def __init__(self, message, func, on_done=None, blocking=False):
+        self.message, self.on_done, self.blocking = message, on_done, blocking
+        self.result = self.error = None
+        self.done = False
+        threading.Thread(target=self._run, args=(func,), daemon=True).start()
+
+    def _run(self, func):
+        try:
+            self.result = func()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            self.error = exc
+        finally:
+            self.done = True
+
+
+@dataclass
+class AppState:
+    """Everything the UI needs between frames."""
+
+    out_dir: Path
+    drives: list = field(default_factory=list)
+    sel: int = 0
+    top: int = 0
+    view: str = "drives"
+    drive: Drive | None = None
+    data: DriveData | None = None
+    raw: str | None = None
+    tab: int = 0
+    scroll: dict = field(default_factory=dict)
+    status: str = ""
+    status_style: str | None = None
+    status_time: float = 0.0
+    job: Job | None = None
+    pending_g: bool = False
+    body_height: int = 10
+    cache_key: tuple = ()
+    cache_lines: list = field(default_factory=list)
+
+    def set_status(self, text, style=None):
+        """Show a transient message in the status line."""
+        self.status, self.status_style, self.status_time = text, style, time.time()
+
+    def lines(self, width):
+        """Return (cached) display lines for the current tab."""
+        key = (self.tab, width, id(self.data), id(self.raw), self.drive.name if self.drive else None)
+        if key != self.cache_key:
+            if self.tab == RAW_TAB:
+                built = build_raw(self.raw, width)
+            elif self.data is None:
+                built = [("dim", "Loading...")]
+            elif self.data.json is None:
+                built = [("bad", f"Could not read this drive: {self.data.error}")]
+                if os.geteuid() != 0 and not os.environ.get("SMARTCTLTUI_SMARTCTL"):
+                    built.append(("warn", "Not running as root - smartctl normally needs root to access drives."))
+            else:
+                built = BUILDERS[self.tab](self.data.json, width)
+            self.cache_key, self.cache_lines = key, built
+        return self.cache_lines
+
+    def test_running(self):
+        """Return True if the drive reports a self-test in progress."""
+        d = self.data.json if self.data and self.data.json else {}
+        if get(d, "ata_smart_data", "self_test", "status", "remaining_percent") is not None:
+            return True
+        return bool(get(d, "nvme_self_test_log", "current_self_test_operation", "value", default=0))
+
+
+def start_refresh(st, quiet=False):
+    """Begin a non-blocking reload of the current drive's JSON (and raw text if it was loaded)."""
+    if st.job or not st.drive:
+        return
+    drive, want_raw = st.drive, st.raw is not None or st.tab == RAW_TAB
+
+    def work():
+        return fetch_drive(drive), (fetch_raw(drive) if want_raw else None)
+
+    def done(job):
+        if st.drive is not drive:
+            return
+        if job.error:
+            st.set_status(f"Refresh failed: {job.error}", "bad")
+            return
+        st.data, raw = job.result
+        if raw is not None:
+            st.raw = raw
+        if not quiet:
+            st.set_status("Refreshed", "good")
+
+    st.job = Job(f"Reading {drive.name}", work, done)
+
+
+def run_blocking(stdscr, st, message, func):
+    """Run ``func`` in a thread while animating a spinner; return (result, error)."""
+    job = Job(message, func, blocking=True)
+    st.job = job
+    while not job.done:
+        draw(stdscr, st)
+        stdscr.timeout(100)
+        stdscr.getch()
+    st.job = None
+    curses.flushinp()
+    return job.result, job.error
+
+
+def tick(st):
+    """Per-frame housekeeping: finish jobs, expire status, auto-poll running tests."""
+    if st.job and st.job.done and not st.job.blocking:
+        job, st.job = st.job, None
+        if job.on_done:
+            job.on_done(job)
+    if st.status and time.time() - st.status_time > STATUS_TTL:
+        st.status = ""
+    if st.view == "drive" and not st.job and st.data and st.test_running() and time.time() - st.data.fetched > POLL_SECONDS:
+        start_refresh(st, quiet=True)
+
+
+# --------------------------------------------------------------------------
+# Drawing
+# --------------------------------------------------------------------------
+
+
+def put(win, y, x, text, attr=0, maxw=None):
+    """addnstr that never raises on edge/overflow."""
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return
+    n = (w - x) if maxw is None else min(maxw, w - x)
+    try:
+        win.addnstr(y, x, text, max(n, 0), attr)
+    except curses.error:
+        pass
+
+
+def style_attr(style):
+    """Map a line style name to a curses attribute."""
+    base = ATTRS.get(style, 0) if style else 0
+    pair = {"dim": PAIR_DIM, "good": PAIR_GOOD, "bad": PAIR_BAD, "warn": PAIR_WARN}.get(style)
+    if pair and style != "dim":
+        return base | curses.color_pair(pair)
+    return base
+
+
+def draw_panel_border(win, y, x, height, width, title=None):
+    """Draw a rounded box with an optional title embedded in the top edge."""
+    inner = max(width - 2, 0)
+    top = (BOX_H + title[: max(inner - 1, 0)]).ljust(inner, BOX_H) if title else BOX_H * inner
+    put(win, y, x, BOX_TL + top + BOX_TR, 0, width)
+    for row in range(1, height - 1):
+        put(win, y + row, x, BOX_V, 0, 1)
+        put(win, y + row, x + width - 1, BOX_V, 0, 1)
+    put(win, y + height - 1, x, BOX_BL + BOX_H * (width - 2) + BOX_BR, 0, width)
+
+
+def draw_chrome(win, st, title_right):
+    """Draw the title bar, status line and key hint; return (height, width)."""
+    h, w = win.getmaxyx()
+    put(win, 0, 1, APP_BRAND, curses.A_BOLD)
+    if title_right:
+        put(win, 0, max(w - len(title_right) - 1, len(APP_BRAND) + 3), title_right, ATTRS["dim"])
+    if st.job:
+        frame = SPINNER[int(time.time() * 10) % len(SPINNER)]
+        put(win, h - 2, 1, f"{frame} {st.job.message}...", style_attr("warn"))
+    elif st.status:
+        put(win, h - 2, 1, st.status, style_attr(st.status_style))
+    hint = (
+        "j/k move  Enter open  o open device  r rescan  ? help  q quit"
+        if st.view == "drives"
+        else "h/l tabs  j/k gg/G scroll  t tests  s save  r refresh  ? help  q back"
+    )
+    put(win, h - 1, 1, hint, ATTRS["dim"])
+    return h, w
+
+
+def draw_drives(win, st):
+    """Draw the drive selection list."""
+    h, w = draw_chrome(win, st, "select a drive")
+    height = h - 3
+    draw_panel_border(win, 1, 0, height, w, "Drives")
+    inner_h = height - 2
+    if not st.drives:
+        put(win, 3, 3, "No drives found. Press o to enter a device manually, r to rescan.", ATTRS["dim"])
+        if os.geteuid() != 0 and not os.environ.get("SMARTCTLTUI_SMARTCTL"):
+            put(win, 4, 3, "Not running as root - smartctl normally needs root to see drives.", style_attr("warn"))
+        return
+    st.sel = max(0, min(st.sel, len(st.drives) - 1))
+    st.top = max(0, min(st.top, st.sel), st.sel - inner_h + 2)
+    cols = (14, 7, 0, 20, 10, 7)
+    model_w = max(10, w - 4 - sum(cols) - 5 * 2)
+    header = f"{'DEVICE':<14}  {'TYPE':<7}  {'MODEL':<{model_w}}  {'SERIAL':<20}  {'SIZE':>10}  {'HEALTH':<7}"
+    put(win, 2, 2, header, ATTRS["dim"])
+    for i, drv in enumerate(st.drives[st.top : st.top + inner_h - 1]):
+        idx = st.top + i
+        health = drv.health or "?"
+        model = drv.model if not drv.error else f"({drv.error})"
+        row = (
+            f"{drv.name:<14}  {(drv.dtype or '-'):<7}  {model[:model_w]:<{model_w}}  "
+            f"{drv.serial[:20]:<20}  {human_bytes(drv.size) if drv.size else '-':>10}  "
+        )
+        attr = curses.A_REVERSE if idx == st.sel else 0
+        put(win, 3 + i, 2, row.ljust(w - 4), attr, w - 4)
+        hx = 2 + len(row)
+        hstyle = "good" if health == "PASSED" else "bad" if health == "FAILED" else "dim"
+        put(win, 3 + i, hx, f"{health:<7}", style_attr(hstyle) | attr, w - hx - 1)
+
+
+def draw_drive(win, st):
+    """Draw the per-drive tabbed view."""
+    drv = st.drive
+    title = f"{drv.name}  {drv.model}" if drv.model else drv.name
+    h, w = draw_chrome(win, st, title)
+    x = 1
+    for i, name in enumerate(TABS):
+        label = f" {i + 1} {name} "
+        put(win, 1, x, label, curses.A_REVERSE if i == st.tab else ATTRS["dim"])
+        x += len(label) + 1
+    height = h - 4
+    draw_panel_border(win, 2, 0, height, w, TABS[st.tab])
+    inner_h = height - 2
+    st.body_height = inner_h
+    lines = st.lines(w - 4)
+    top = max(0, min(st.scroll.get(st.tab, 0), len(lines) - inner_h))
+    st.scroll[st.tab] = top
+    for i, (style, text) in enumerate(lines[top : top + inner_h]):
+        put(win, 3 + i, 2, text, style_attr(style), w - 4)
+    if len(lines) > inner_h:
+        info = f" {top + 1}-{min(top + inner_h, len(lines))}/{len(lines)} "
+        put(win, 2 + height - 1, max(w - len(info) - 2, 1), info, ATTRS["dim"])
+
+
+def draw(win, st):
+    """Redraw the whole screen for the current view."""
+    win.erase()
+    (draw_drives if st.view == "drives" else draw_drive)(win, st)
+    win.refresh()
+
+
+# --------------------------------------------------------------------------
+# Popups: menu, text prompt, message, confirm
+# --------------------------------------------------------------------------
+
+
+def read_key(win):
+    """Read one key (str for characters, int for special keys); None on timeout."""
+    try:
+        return win.get_wch()
+    except curses.error:
+        return None
+
+
+def is_enter(k):
+    """Return True for any Enter key."""
+    return k in ("\n", "\r", curses.KEY_ENTER)
+
+
+def popup_box(win, title, height, width):
+    """Clear and frame a centered popup; return its (y, x)."""
+    h, w = win.getmaxyx()
+    width, height = min(width, w), min(height, h)
+    y, x = max((h - height) // 2, 0), max((w - width) // 2, 0)
+    for r in range(height):
+        put(win, y + r, x, " " * width, 0, width)
+    draw_panel_border(win, y, x, height, width, title)
+    return y, x
+
+
+def popup_menu(win, title, items):
+    """Show a selectable menu of ``(label, enabled)``; return the chosen index or None."""
+    sel = next((i for i, (_, ok) in enumerate(items) if ok), 0)
+    width = max(len(label) for label, _ in items) + 8
+    win.timeout(-1)
+    while True:
+        y, x = popup_box(win, title, len(items) + 4, max(width, len(title) + 6))
+        for i, (label, ok) in enumerate(items):
+            attr = curses.A_REVERSE if i == sel else (0 if ok else ATTRS["dim"])
+            put(win, y + 2 + i, x + 2, f" {i + 1} {label}".ljust(width - 4), attr, width - 4)
+        win.refresh()
+        k = read_key(win)
+        if k in ("q", "\x1b"):
+            return None
+        if k in ("j", curses.KEY_DOWN):
+            sel = (sel + 1) % len(items)
+        elif k in ("k", curses.KEY_UP):
+            sel = (sel - 1) % len(items)
+        elif isinstance(k, str) and k.isdigit() and 1 <= int(k) <= len(items) and items[int(k) - 1][1]:
+            return int(k) - 1
+        elif is_enter(k) and items[sel][1]:
+            return sel
+
+
+def popup_text(win, title, default=""):
+    """Single-line editor; return the entered text or None if cancelled."""
+    h, w = win.getmaxyx()
+    width = min(max(w - 8, 20), 100)
+    buf, pos = list(default), len(default)
+    win.timeout(-1)
+    curses.curs_set(1)
+    try:
+        while True:
+            y, x = popup_box(win, title, 5, width)
+            field_w = width - 4
+            start = max(0, pos - field_w + 1)
+            put(win, y + 2, x + 2, "".join(buf)[start : start + field_w], 0, field_w)
+            put(win, y + 3, x + 2, "Enter accept   Esc cancel", ATTRS["dim"], field_w)
+            win.move(y + 2, x + 2 + pos - start)
+            win.refresh()
+            k = read_key(win)
+            if k == "\x1b":
+                return None
+            if is_enter(k):
+                return "".join(buf).strip()
+            if k in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                if pos:
+                    del buf[pos - 1]
+                    pos -= 1
+            elif k == curses.KEY_DC:
+                if pos < len(buf):
+                    del buf[pos]
+            elif k == curses.KEY_LEFT:
+                pos = max(0, pos - 1)
+            elif k == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1)
+            elif k in (curses.KEY_HOME, "\x01"):
+                pos = 0
+            elif k in (curses.KEY_END, "\x05"):
+                pos = len(buf)
+            elif k == "\x15":
+                buf, pos = [], 0
+            elif isinstance(k, str) and k.isprintable():
+                buf.insert(pos, k)
+                pos += 1
+    finally:
+        curses.curs_set(0)
+
+
+def popup_message(win, title, lines, prompt="Press any key"):
+    """Show a message box and wait for a key; return the key."""
+    width = max(max(len(s) for s in lines), len(prompt), len(title)) + 6
+    win.timeout(-1)
+    y, x = popup_box(win, title, len(lines) + 5, width)
+    for i, text in enumerate(lines):
+        put(win, y + 2 + i, x + 2, text, 0, width - 4)
+    put(win, y + len(lines) + 3, x + 2, prompt, ATTRS["dim"], width - 4)
+    win.refresh()
+    while True:
+        k = read_key(win)
+        if k is not None and k != curses.KEY_RESIZE:
+            return k
+
+
+def popup_confirm(win, message):
+    """Ask a yes/no question."""
+    return popup_message(win, "Confirm", [message], "y = yes, any other key = no") in ("y", "Y")
+
+
+HELP_LINES = [
+    "Drive list",
+    "  j/k, gg/G   move          Enter   open drive",
+    "  o           enter a device by hand (e.g. /dev/sdb -d sat)",
+    "  r           rescan        q       quit",
+    "",
+    "Drive view",
+    "  h/l, Tab, 1-8   switch tab    j/k, Ctrl-d/u, gg/G   scroll",
+    "  t   self-tests, enable SMART  s   save a report to disk",
+    "  r   refresh                   q   back to drive list",
+]
+
+
+# --------------------------------------------------------------------------
+# Actions
+# --------------------------------------------------------------------------
+
+
+def invoking_user():
+    """Return (home dir, uid, gid) of the user who started us, even through sudo."""
+    name = os.environ.get("SUDO_USER")
+    if name and os.geteuid() == 0:
+        try:
+            p = pwd.getpwnam(name)
+            return Path(p.pw_dir), p.pw_uid, p.pw_gid
+        except KeyError:
+            pass
+    return Path.home(), None, None
+
+
+def reload_after_action(stdscr, st):
+    """Fetch fresh data synchronously after an action changed drive state."""
+    data, err = run_blocking(stdscr, st, f"Reading {st.drive.name}", lambda: fetch_drive(st.drive))
+    if err:
+        st.set_status(f"Refresh failed: {err}", "bad")
+    else:
+        st.data = data
+
+
+def test_menu(stdscr, st):
+    """Offer self-tests and SMART switches for the open drive."""
+    d = st.data.json if st.data and st.data.json else {}
+    poll = get(d, "ata_smart_data", "self_test", "polling_minutes", default={})
+    nvme = is_nvme(d)
+    smart_on = get(d, "smart_support", "enabled")
+    items = [
+        ("Short self-test" + (f" (~{poll['short']} min)" if "short" in poll else ""), "-t short"),
+        ("Extended self-test" + (f" (~{poll['extended']} min)" if "extended" in poll else ""), "-t long"),
+        ("Conveyance self-test (ATA)" + (f" (~{poll['conveyance']} min)" if "conveyance" in poll else ""), "-t conveyance"),
+        ("Immediate offline data collection (ATA)", "-t offline"),
+        ("Abort running self-test", "-X"),
+        ("Enable SMART", "-s on"),
+        ("Disable SMART", "-s off"),
+    ]
+    enabled = [
+        True,
+        True,
+        "conveyance" in poll,
+        is_ata(d) and not nvme,
+        True,
+        smart_on is False,
+        smart_on is True,
+    ]
+    choice = popup_menu(stdscr, "Tests and actions", [(label, ok) for (label, _), ok in zip(items, enabled)])
+    if choice is None:
+        return
+    label, args = items[choice]
+    draw(stdscr, st)
+    if args == "-s off" and not popup_confirm(stdscr, "Disable SMART on this drive?"):
+        return
+    if args in ("-t long", "-t offline") and not popup_confirm(stdscr, f"{label.split(' (')[0]} may slow the drive. Start?"):
+        return
+    result, err = run_blocking(stdscr, st, label.split(" (")[0], lambda: run_action(st.drive, args.split()))
+    ok, msg = (False, str(err)) if err else result
+    st.set_status(msg if ok else f"Failed: {msg}", "good" if ok else "bad")
+    if ok:
+        reload_after_action(stdscr, st)
+        st.tab = TABS.index("Self-Tests") if args.startswith("-t") else st.tab
+
+
+def safe_name(text):
+    """Make text safe for use in a filename."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_") or "drive"
+
+
+def save_menu(stdscr, st):
+    """Save the current tab, full text report, or full JSON to a file."""
+    drv = st.drive
+    choice = popup_menu(
+        stdscr,
+        "Save report",
+        [(f"Current tab ({TABS[st.tab]}) as text", True), ("Full report as text (smartctl -x)", True), ("Full report as JSON", True)],
+    )
+    if choice is None:
+        return
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"smartctl_{safe_name(drv.model or drv.name)}_{safe_name(drv.serial)}_{stamp}"
+    suffix, ext = [(f"_{safe_name(TABS[st.tab].lower())}", "txt"), ("", "txt"), ("", "json")][choice]
+    draw(stdscr, st)
+    path_text = popup_text(stdscr, "Save as", str(st.out_dir / f"{base}{suffix}.{ext}"))
+    if not path_text:
+        return
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = st.out_dir / path
+    draw(stdscr, st)
+    if path.exists() and not popup_confirm(stdscr, f"{path.name} exists. Overwrite?"):
+        return
+    if choice == 0:
+        header = f"{APP_BRAND} - {TABS[st.tab]} - {drv.name} {drv.model} {drv.serial} - {datetime.now():%Y-%m-%d %H:%M:%S}"
+        content = "\n".join([header, "=" * len(header), ""] + [t for _, t in st.lines(100)]) + "\n"
+    elif choice == 1:
+        if st.raw is None:
+            raw, err = run_blocking(stdscr, st, "Reading smartctl output", lambda: fetch_raw(drv))
+            if err:
+                st.set_status(f"Save failed: {err}", "bad")
+                return
+            st.raw = raw
+        content = st.raw
+    else:
+        if not st.data or st.data.json is None:
+            st.set_status("Save failed: no data loaded", "bad")
+            return
+        content = json.dumps(st.data.json, indent=2) + "\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        _, uid, gid = invoking_user()
+        if uid is not None:
+            os.chown(path, uid, gid)
+    except OSError as exc:
+        st.set_status(f"Save failed: {exc}", "bad")
+        return
+    st.set_status(f"Saved {path}", "good")
+
+
+def open_device(stdscr, st):
+    """Prompt for a device path (optionally with ``-d type``) and add it to the list."""
+    text = popup_text(stdscr, "Device (e.g. /dev/sdb  or  /dev/sdb -d sat)", "/dev/")
+    if not text:
+        return
+    try:
+        tokens = shlex.split(text)
+    except ValueError as exc:
+        st.set_status(f"Bad input: {exc}", "bad")
+        return
+    dtype, name = None, None
+    it = iter(tokens)
+    for tok in it:
+        if tok == "-d":
+            dtype = next(it, None)
+        elif tok.startswith("-d") and len(tok) > 2:
+            dtype = tok[2:]
+        else:
+            name = tok
+    if not name:
+        return
+    drive, err = run_blocking(stdscr, st, f"Probing {name}", lambda: fill_summary(Drive(name, dtype)))
+    if err:
+        st.set_status(str(err), "bad")
+        return
+    st.drives.append(drive)
+    st.sel = len(st.drives) - 1
+    if drive.error:
+        st.set_status(f"{name}: {drive.error}", "bad")
+
+
+def rescan(stdscr, st):
+    """Rediscover drives."""
+    drives, err = run_blocking(stdscr, st, "Scanning for drives", scan_drives)
+    if err:
+        st.set_status(f"Scan failed: {err}", "bad")
+        return
+    st.drives, st.sel = drives, 0
+
+
+def open_drive(stdscr, st):
+    """Enter the tabbed view for the selected drive."""
+    st.drive = st.drives[st.sel]
+    st.data, st.raw, st.tab, st.scroll, st.cache_key = None, None, 0, {}, ()
+    st.view = "drive"
+    data, err = run_blocking(stdscr, st, f"Reading {st.drive.name}", lambda: fetch_drive(st.drive))
+    st.data = data if not err else DriveData(error=str(err))
+
+
+# --------------------------------------------------------------------------
+# Input handling
+# --------------------------------------------------------------------------
+
+
+def handle_drives_key(stdscr, st, k):
+    """Handle a key in the drive list; return False to quit."""
+    g, st.pending_g = st.pending_g, False
+    n = len(st.drives)
+    if k in ("q", "\x1b"):
+        return False
+    if k in ("j", curses.KEY_DOWN) and n:
+        st.sel = min(st.sel + 1, n - 1)
+    elif k in ("k", curses.KEY_UP):
+        st.sel = max(st.sel - 1, 0)
+    elif k == "g":
+        if g:
+            st.sel = 0
+        else:
+            st.pending_g = True
+    elif k == "G" and n:
+        st.sel = n - 1
+    elif is_enter(k) and n:
+        open_drive(stdscr, st)
+    elif k == "o":
+        open_device(stdscr, st)
+    elif k == "r":
+        rescan(stdscr, st)
+    elif k == "?":
+        popup_message(stdscr, "Help", HELP_LINES)
+    return True
+
+
+def handle_drive_key(stdscr, st, k):
+    """Handle a key in the drive view."""
+    g, st.pending_g = st.pending_g, False
+    page = max(st.body_height - 1, 1)
+    scroll = st.scroll.get(st.tab, 0)
+    last = max(len(st.lines(100)) - st.body_height, 0)
+    if k in ("q", "\x1b"):
+        st.view, st.job = "drives", None
+        return
+    new_tab = None
+    if k in ("l", curses.KEY_RIGHT, "\t"):
+        new_tab = (st.tab + 1) % len(TABS)
+    elif k in ("h", curses.KEY_LEFT, curses.KEY_BTAB):
+        new_tab = (st.tab - 1) % len(TABS)
+    elif isinstance(k, str) and k.isdigit() and 1 <= int(k) <= len(TABS):
+        new_tab = int(k) - 1
+    if new_tab is not None:
+        st.tab = new_tab
+        if st.tab == RAW_TAB and st.raw is None and not st.job:
+            drv = st.drive
+            st.job = Job(
+                "Reading smartctl output",
+                lambda: fetch_raw(drv),
+                lambda job: setattr(st, "raw", job.result if not job.error else f"Error: {job.error}"),
+            )
+        return
+    if k in ("j", curses.KEY_DOWN):
+        scroll += 1
+    elif k in ("k", curses.KEY_UP):
+        scroll -= 1
+    elif k in ("\x04", curses.KEY_NPAGE, " "):
+        scroll += page
+    elif k in ("\x15", curses.KEY_PPAGE, "b"):
+        scroll -= page
+    elif k == "g":
+        if g:
+            scroll = 0
+        else:
+            st.pending_g = True
+    elif k == "G":
+        scroll = last
+    elif k == "r":
+        start_refresh(st)
+    elif k == "t":
+        test_menu(stdscr, st)
+    elif k == "s":
+        save_menu(stdscr, st)
+    elif k == "?":
+        popup_message(stdscr, "Help", HELP_LINES)
+    st.scroll[st.tab] = max(0, min(scroll, last))
+
+
+def init_colors():
+    """Follow the terminal theme; add green/yellow/red for status only."""
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        dim = COLOR_BRIGHT_BLACK if curses.COLORS >= 16 else curses.COLOR_BLACK
+        curses.init_pair(PAIR_DIM, dim, -1)
+        curses.init_pair(PAIR_GOOD, curses.COLOR_GREEN, -1)
+        curses.init_pair(PAIR_BAD, curses.COLOR_RED, -1)
+        curses.init_pair(PAIR_WARN, curses.COLOR_YELLOW, -1)
+        ATTRS["dim"] = curses.color_pair(PAIR_DIM) | (curses.A_BOLD if curses.COLORS < 16 else 0)
+    except curses.error:
+        pass
+
+
+def main(stdscr, out_dir):
+    """Run the app's main event loop."""
+    init_colors()
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    st = AppState(out_dir=out_dir)
+    rescan(stdscr, st)
+    running = True
+    while running:
+        tick(st)
+        draw(stdscr, st)
+        stdscr.timeout(150)
+        k = read_key(stdscr)
+        if k is None or k == curses.KEY_RESIZE:
+            continue
+        if st.view == "drives":
+            running = handle_drives_key(stdscr, st, k)
+        else:
+            handle_drive_key(stdscr, st, k)
+
+
+def ensure_root(argv):
+    """Re-run under sudo when not root (smartctl needs it to open drives)."""
+    if os.geteuid() == 0 or os.environ.get("SMARTCTLTUI_SMARTCTL"):
+        return
+    if shutil.which("sudo") is None:
+        print("Warning: not running as root and sudo not found; drives may be inaccessible.", file=sys.stderr)
+        return
+    print("smartctl needs root to access drives; re-running with sudo...", file=sys.stderr)
+    os.execvp("sudo", ["sudo", sys.executable, os.path.abspath(__file__)] + argv)
+
+
+if __name__ == "__main__":
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=APP_BRAND)
+    parser.add_argument("--no-sudo", action="store_true", help="do not re-run under sudo when not root")
+    parser.add_argument("--output-dir", type=Path, default=None, help="default directory for saved reports (default: home)")
+    args = parser.parse_args()
+
+    if shutil.which(SMARTCTL_CMD[0]) is None:
+        print("Required tool not found: smartctl (install the smartmontools package)", file=sys.stderr)
+        sys.exit(1)
+    if not args.no_sudo:
+        ensure_root(sys.argv[1:])
+
+    setup_glyphs()
+    try:
+        curses.wrapper(main, (args.output_dir or invoking_user()[0]).expanduser())
+    except KeyboardInterrupt:
+        pass
